@@ -1,9 +1,10 @@
 import itertools
 import json
+import os
 import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, BinaryIO
+from typing import Dict, List, Tuple, BinaryIO, Union, Optional
 
 import numpy as np
 from PIL import Image
@@ -278,6 +279,163 @@ class BlenderViewData(ViewData):
             x=np.array(info["x"], dtype=np.float32),
             y=np.array(info["y"], dtype=np.float32),
             z=np.array(info["z"], dtype=np.float32),
+            width=width,
+            height=height,
+            x_fov=info["x_fov"],
+            y_fov=info["y_fov"],
+        )
+    
+
+def rotation_from_forward_vec(forward_vec: Union[np.ndarray, list], up_axis: str = 'Y',
+                              inplane_rot: Optional[float] = None) -> np.ndarray:
+    """ Returns a camera rotation matrix for the given forward vector and up axis using NumPy
+
+    :param forward_vec: The forward vector which specifies the direction the camera should look.
+    :param up_axis: The up axis, usually Y.
+    :param inplane_rot: The in-plane rotation in radians. If None is given, the in-plane rotation is determined only
+                        based on the up vector.
+    :return: The corresponding rotation matrix.
+    """
+    # Normalize the forward vector
+    forward_vector = np.array(forward_vec, dtype=np.float64)
+    forward_vector_norm = forward_vector / np.linalg.norm(forward_vector, axis=1, keepdims=True)
+
+    # forward_vec = forward_vec / np.linalg.norm(forward_vec)
+
+    # Define the up vector
+    if up_axis.upper() == 'Y':
+        up_vec = np.array([0.0, 1.0, 0.0])
+    elif up_axis.upper() == 'Z':
+        up_vec = np.array([0.0, 0.0, 1.0])
+    elif up_axis.upper() == 'X':
+        up_vec = np.array([1.0, 0.0, 0.0])
+    else:
+        raise ValueError("Invalid up_axis. Choose from 'X', 'Y', or 'Z'.")
+
+    # Compute the right vector (cross product of forward and up)
+    # right_vec = np.cross(up_vec, forward_vector_norm) # left-hand
+    right_vec = np.cross(forward_vector_norm, up_vec)   # right-hand
+    right_vec /= np.linalg.norm(right_vec, axis=1, keepdims=True)
+
+    # Recompute the true up vector (orthogonal to forward and right)
+    # up_vec = np.cross(forward_vector_norm, right_vec) # left-hand
+    up_vec = np.cross(right_vec, forward_vector_norm) # right-hand
+    up_vec /= np.linalg.norm(up_vec, axis=1, keepdims=True)
+
+    # # Recompute the right vector
+    # right_vec = np.cross(forward_vector_norm, up_vec)
+    # right_vec /= np.linalg.norm(right_vec, axis=1, keepdims=True)
+
+    # Construct the rotation matrix (columns represent right, up, forward)
+    rotation_matrix = np.stack((right_vec, up_vec, -forward_vector_norm), axis=-1)
+    # rotation_matrix = np.stack((right_vec, up_vec, -forward_vector_norm), axis=1)
+
+    # Apply in-plane rotation if specified
+    if inplane_rot is not None:
+        inplane_rotation = np.array([
+            [np.cos(inplane_rot), -np.sin(inplane_rot), 0],
+            [np.sin(inplane_rot),  np.cos(inplane_rot), 0],
+            [0,                   0,                   1]
+        ])
+        rotation_matrix = rotation_matrix @ inplane_rotation
+
+    return rotation_matrix
+
+
+class Front3DBlenderViewData(ViewData):
+    """
+    Interact with a dataset zipfile exported by view_data.py.
+    """
+
+    def __init__(self, render_path, camera_path):
+        # self.zipfile = zipfile.ZipFile(f_obj, mode="r")
+        # self.infos = []
+        # with self.zipfile.open("info.json", "r") as f:
+        #     self.info = json.load(f)
+        # assert all(k in cam_info for k in ["origin", "x", "y", "z", "x_fov", "y_fov"])
+        self.render_path = render_path
+        self.camera_path = camera_path
+        camera = np.load(os.path.join(camera_path, "boxes.npz"), allow_pickle=True)
+        self.build_cam_info(camera)
+        # self.channels = list(self.info.get("channels", "RGBAD"))
+        self.channels = list("RGBAD")
+        assert set("RGBA").issubset(
+            set(self.channels)
+        ), "The blender output should at least have RGBA images."
+        # names = set(x.filename for x in self.zipfile.infolist())
+        # for i in itertools.count():
+        #     name = f"{i:05}.json"
+        #     if name not in names:
+        #         break
+        #     with self.zipfile.open(name, "r") as f:
+        #         self.infos.append(json.load(f))
+
+    @property
+    def num_views(self) -> int:
+        return len(self.infos)
+
+    @property
+    def channel_names(self) -> List[str]:
+        return list(self.channels)
+    
+    def build_cam_info(self, camera):
+        camera_coords = camera["camera_coords"]
+        target_coords = camera["target_coords"]
+        floor_plan_centroid = camera["floor_plan_centroid"]
+
+        forward_vec = target_coords - camera_coords
+        rotation_matrix = rotation_from_forward_vec(forward_vec)
+        right_vec, up_vec, forward_vec = (
+            rotation_matrix[..., 0], rotation_matrix[..., 1], rotation_matrix[..., 2]
+        )
+        self.infos = []
+        for i in range(len(rotation_matrix)):
+            # print(f"Rotation matrix {i}:")
+            # print(rotation_matrix[i])
+            # print()
+            self.infos.append(
+                {
+                    "origin": camera_coords[i], # Camera origin
+                    "x": -right_vec[i], # right
+                    "y": -up_vec[i], # up
+                    "z": -forward_vec[i], # forward
+                    "x_fov": np.deg2rad(70), # 70
+                    "y_fov": np.deg2rad(70), # 70
+                }
+            )
+
+    def load_view(self, index: int, channels: List[str]) -> Tuple[Camera, np.ndarray]:
+        for ch in channels:
+            if ch not in self.channel_names:
+                raise ValueError(f"unsupported channel: {ch}")
+
+        channel_map = {}
+        if any(x in channels for x in "RGBA"):
+            rgba = np.array(Image.open(os.path.join(self.render_path, f"{str(index).zfill(4)}_colors.png"))) / 255.0
+            channel_map.update(zip("RGBA", rgba.transpose([2, 0, 1])))
+        if "D" in channels:
+            depth = np.load(os.path.join(self.render_path, f"{str(index).zfill(4)}_depth.npy"))
+            inf_dist = depth == 20.0
+            channel_map["D"] = np.where(
+                inf_dist, 
+                np.inf, 
+                # (20) * (depth.astype(np.float32) / 65535.0) # max_depth: scaling points
+                # 0.1 + (depth.astype(np.float32) / 255.0) * (1000 - 0.1)
+                depth
+            )
+
+        combined = np.stack([channel_map[k] for k in channels], axis=-1)
+        h, w, _ = combined.shape
+        return self.camera(index, w, h), combined
+            
+
+    def camera(self, index: int, width: int, height: int) -> ProjectiveCamera:
+        info = self.infos[index]
+        return ProjectiveCamera(
+            origin=np.array(info["origin"], dtype=np.float32),
+            x=np.array(info["x"], dtype=np.float32), # right
+            y=np.array(info["y"], dtype=np.float32), # up
+            z=np.array(info["z"], dtype=np.float32), # forward
             width=width,
             height=height,
             x_fov=info["x_fov"],
